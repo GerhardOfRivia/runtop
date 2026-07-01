@@ -1,0 +1,127 @@
+name: runtop Build & Release
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+
+      - name: Determine Version
+        run: |
+          echo "SEMVER=$(grep ^SEMVER Makefile | awk '{print $3}')" >> $GITHUB_ENV
+          echo "VERSION=$(grep ^SEMVER Makefile | awk '{print $3}')-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Run Tests
+        run: make test
+
+      - name: Build Binary
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          make build OUTPUT=dist/runtop-${GOOS}-${GOARCH} VERSION=${{ env.VERSION }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtop-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/runtop-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+
+      - name: Determine Version
+        run: |
+          echo "SEMVER=$(grep ^SEMVER Makefile | awk '{print $3}')" >> $GITHUB_ENV
+          echo "VERSION=$(grep ^SEMVER Makefile | awk '{print $3}')-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Prepare Release Files
+        run: |
+          mkdir -p release
+
+          cp dist/runtop-linux-amd64/runtop-linux-amd64 release/
+          cp dist/runtop-linux-arm64/runtop-linux-arm64 release/
+          cp dist/runtop-darwin-amd64/runtop-darwin-amd64 release/
+          cp dist/runtop-darwin-arm64/runtop-darwin-arm64 release/
+          sha256sum release/* > release/checksums.txt
+
+          ls -lah release
+
+      - name: Create or Update latest Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Remove old latest release/tag if present
+          gh release delete latest --yes || true
+          git push origin :refs/tags/latest || true
+
+          # Recreate latest tag
+          git tag -f latest
+          git push origin latest -f
+
+          # Create latest release with all artifacts
+          gh release create latest release/* \
+            --title "Latest Build" \
+            --notes "Automated build from main (${GITHUB_SHA})"
+
+      - name: Create or Update Versioned Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create/update version tag
+          git tag -f "${SEMVER}"
+          git push origin "${SEMVER}" -f
+
+          # Remove existing release if it exists
+          gh release delete "${SEMVER}" --yes || true
+
+          # Create versioned release with all artifacts
+          gh release create "${SEMVER}" release/* \
+            --title "runtop ${SEMVER}" \
+            --notes "Automated release for version ${SEMVER}"
+
