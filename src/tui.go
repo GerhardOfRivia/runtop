@@ -291,7 +291,11 @@ func (m *Model) View() string {
 	numGPUs := len(m.telemetryData.GPUs)
 
 	cpuLines := (numCPUs + 1) / 2
-	sysLines := 2 + numGPUs // RAM + Disk + GPUs
+	diskCount := len(m.telemetryData.Disks)
+	if diskCount == 0 {
+		diskCount = 1
+	}
+	sysLines := 2 + diskCount + numGPUs // RAM + Swap + Disks + GPUs
 
 	telemetryContentHeight := cpuLines
 	if sysLines > telemetryContentHeight {
@@ -317,7 +321,10 @@ func (m *Model) View() string {
 	)
 
 	// Bottom Half Telemetry Box
-	telemetryTitle := lipgloss.NewStyle().Bold(true).Foreground(subtleColor).Render(" system telemetry ")
+	uptimeStr := formatUptime(m.telemetryData.Uptime)
+	loadStr := fmt.Sprintf("load: %.2f %.2f %.2f", m.telemetryData.Load1, m.telemetryData.Load5, m.telemetryData.Load15)
+	telemetryTitleText := fmt.Sprintf(" system telemetry | %s | %s ", loadStr, uptimeStr)
+	telemetryTitle := lipgloss.NewStyle().Bold(true).Foreground(subtleColor).Render(telemetryTitleText)
 	
 	var telemetryBody string
 	if m.terminalWidth > 50 {
@@ -397,7 +404,7 @@ func (m *Model) renderCPUsPanel(width int) string {
 	return lipgloss.NewStyle().Width(width).Render(body)
 }
 
-// renderSystemPanel renders system RAM, Disk, and GPUs.
+// renderSystemPanel renders system RAM, Disk, Swap, and GPUs.
 func (m *Model) renderSystemPanel(width int) string {
 	var lines []string
 
@@ -407,8 +414,17 @@ func (m *Model) renderSystemPanel(width int) string {
 
 	// RAM
 	lines = append(lines, m.renderCoreLine("RAM", m.telemetryData.RAM, warnColor, width))
-	// Disk
-	lines = append(lines, m.renderCoreLine("DSK", m.telemetryData.Disk, errorColor, width))
+	// SWP
+	lines = append(lines, m.renderCoreLine("SWP", m.telemetryData.Swap, warnColor, width))
+
+	// Disks (all mounted drives)
+	if len(m.telemetryData.Disks) == 0 {
+		lines = append(lines, m.renderCoreLine("DSK", m.telemetryData.Disk, errorColor, width))
+	} else {
+		for _, d := range m.telemetryData.Disks {
+			lines = append(lines, m.renderCoreLine("dsk:"+d.Mountpoint, d.UsedPercent, errorColor, width))
+		}
+	}
 
 	// GPUs
 	for i, gpuVal := range m.telemetryData.GPUs {
@@ -460,4 +476,18 @@ func drawProgressBar(percent float64, width int, activeColor lipgloss.TerminalCo
 	emptyStr := strings.Repeat("-", emptyCount)
 
 	return filledStyle.Render(filledStr) + emptyStyle.Render(emptyStr)
+}
+
+func formatUptime(seconds uint64) string {
+	days := seconds / 86400
+	hours := (seconds % 86400) / 3600
+	minutes := (seconds % 3600) / 60
+	sec := seconds % 60
+	if days > 0 {
+		return fmt.Sprintf("up %dd %dh %dm %ds", days, hours, minutes, sec)
+	}
+	if hours > 0 {
+		return fmt.Sprintf("up %dh %dm %ds", hours, minutes, sec)
+	}
+	return fmt.Sprintf("up %dm %ds", minutes, sec)
 }

@@ -13,16 +13,29 @@ import (
 
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v3/host"
+	"github.com/shirou/gopsutil/v3/load"
 	"github.com/shirou/gopsutil/v3/mem"
 )
+
+type DiskUsage struct {
+	Mountpoint  string
+	UsedPercent float64
+}
 
 // TelemetryData holds the system telemetry metrics.
 type TelemetryData struct {
 	Timestamp time.Time
-	CPUs      []float64 // Percentage (0-100) per logical CPU
-	RAM       float64   // Percentage (0-100)
-	GPUs      []float64 // Percentage (0-100) per GPU
-	Disk      float64   // Percentage (0-100)
+	CPUs      []float64   // Percentage (0-100) per logical CPU
+	RAM       float64     // Percentage (0-100)
+	Swap      float64     // Percentage (0-100)
+	GPUs      []float64   // Percentage (0-100) per GPU
+	Disk      float64     // Legacy singular disk usage (from "/" or first mount)
+	Disks     []DiskUsage // Mountpoint + UsedPercent for all physical mounted drives
+	Load1     float64
+	Load5     float64
+	Load15    float64
+	Uptime    uint64 // Seconds
 }
 
 // TelemetryCollector defines a clean Go interface for collecting system metrics.
@@ -69,14 +82,82 @@ func (s *SystemCollector) Collect() (TelemetryData, error) {
 		data.RAM = 35.0 + s.randSource.Float64()*15.0
 	}
 
-	// Disk utilization
-	dUsage, err := disk.Usage("/")
+	// Swap utilization
+	sMem, err := mem.SwapMemory()
 	if err == nil {
-		data.Disk = dUsage.UsedPercent
+		data.Swap = sMem.UsedPercent
 	} else {
-		// Mock Disk utilization
-		data.Disk = 45.0 + s.randSource.Float64()*5.0
+		data.Swap = 0.0
 	}
+
+	// Load Average
+	if avg, err := load.Avg(); err == nil {
+		data.Load1 = avg.Load1
+		data.Load5 = avg.Load5
+		data.Load15 = avg.Load15
+	} else {
+		data.Load1 = 0.5 + s.randSource.Float64()*1.0
+		data.Load5 = 0.4 + s.randSource.Float64()*0.8
+		data.Load15 = 0.3 + s.randSource.Float64()*0.6
+	}
+
+	// Uptime
+	if uptime, err := host.Uptime(); err == nil {
+		data.Uptime = uptime
+	} else {
+		data.Uptime = 3600
+	}
+
+	// Mounted drives (physical partitions)
+	var disks []DiskUsage
+	partitions, err := disk.Partitions(false)
+	if err == nil {
+		for _, part := range partitions {
+			if strings.HasPrefix(part.Device, "/dev/loop") {
+				continue
+			}
+			if strings.Contains(part.Mountpoint, "/snap") || strings.Contains(part.Mountpoint, "/var/lib/snapd") {
+				continue
+			}
+			if part.Fstype == "squashfs" || part.Fstype == "tmpfs" {
+				continue
+			}
+			dUsage, err := disk.Usage(part.Mountpoint)
+			if err == nil {
+				disks = append(disks, DiskUsage{
+					Mountpoint:  part.Mountpoint,
+					UsedPercent: dUsage.UsedPercent,
+				})
+			}
+		}
+	}
+
+	if len(disks) == 0 {
+		// Fallback to /
+		dUsage, err := disk.Usage("/")
+		if err == nil {
+			disks = append(disks, DiskUsage{
+				Mountpoint:  "/",
+				UsedPercent: dUsage.UsedPercent,
+			})
+			data.Disk = dUsage.UsedPercent
+		} else {
+			disks = append(disks, DiskUsage{
+				Mountpoint:  "/",
+				UsedPercent: 45.0 + s.randSource.Float64()*5.0,
+			})
+			data.Disk = disks[0].UsedPercent
+		}
+	} else {
+		data.Disk = disks[0].UsedPercent
+		for _, d := range disks {
+			if d.Mountpoint == "/" {
+				data.Disk = d.UsedPercent
+				break
+			}
+		}
+	}
+	data.Disks = disks
 
 	// GPUs utilization (Query real GPU utilization via nvidia-smi)
 	if gpus, err := getNvidiaGPUUtilization(); err == nil {
@@ -128,47 +209,75 @@ func (l *MultiCSVLogger) Log(data TelemetryData) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// 1. Log CPU
-	cpuHeader := make([]string, len(data.CPUs)+1)
+	// 1. Log CPU (with load averages appended)
+	cpuHeader := make([]string, len(data.CPUs)+4)
 	cpuHeader[0] = "timestamp"
-	cpuRow := make([]string, len(data.CPUs)+1)
+	for i := 0; i < len(data.CPUs); i++ {
+		cpuHeader[i+1] = fmt.Sprintf("cpu%d", i)
+	}
+	cpuHeader[len(data.CPUs)+1] = "load1"
+	cpuHeader[len(data.CPUs)+2] = "load5"
+	cpuHeader[len(data.CPUs)+3] = "load15"
+
+	cpuRow := make([]string, len(data.CPUs)+4)
 	cpuRow[0] = data.Timestamp.Format(time.RFC3339)
 	for i, val := range data.CPUs {
-		cpuHeader[i+1] = fmt.Sprintf("cpu%d", i)
 		cpuRow[i+1] = fmt.Sprintf("%.2f", val)
 	}
+	cpuRow[len(data.CPUs)+1] = fmt.Sprintf("%.2f", data.Load1)
+	cpuRow[len(data.CPUs)+2] = fmt.Sprintf("%.2f", data.Load5)
+	cpuRow[len(data.CPUs)+3] = fmt.Sprintf("%.2f", data.Load15)
+
 	if err := l.writeRow(l.CPUPath(), cpuHeader, cpuRow); err != nil {
 		return err
 	}
 
 	// 2. Log GPU
-	gpuHeader := make([]string, len(data.GPUs)+1)
-	gpuHeader[0] = "timestamp"
-	gpuRow := make([]string, len(data.GPUs)+1)
-	gpuRow[0] = data.Timestamp.Format(time.RFC3339)
-	for i, val := range data.GPUs {
-		gpuHeader[i+1] = fmt.Sprintf("gpu%d", i)
-		gpuRow[i+1] = fmt.Sprintf("%.2f", val)
-	}
-	if err := l.writeRow(l.GPUPath(), gpuHeader, gpuRow); err != nil {
-		return err
+	if len(data.GPUs) > 0 {
+		gpuHeader := make([]string, len(data.GPUs)+1)
+		gpuHeader[0] = "timestamp"
+		gpuRow := make([]string, len(data.GPUs)+1)
+		gpuRow[0] = data.Timestamp.Format(time.RFC3339)
+		for i, val := range data.GPUs {
+			gpuHeader[i+1] = fmt.Sprintf("gpu%d", i)
+			gpuRow[i+1] = fmt.Sprintf("%.2f", val)
+		}
+		if err := l.writeRow(l.GPUPath(), gpuHeader, gpuRow); err != nil {
+			return err
+		}
 	}
 
-	// 3. Log RAM
-	ramHeader := []string{"timestamp", "ram"}
+	// 3. Log RAM (with swap appended)
+	ramHeader := []string{"timestamp", "ram", "swap"}
 	ramRow := []string{
 		data.Timestamp.Format(time.RFC3339),
 		fmt.Sprintf("%.2f", data.RAM),
+		fmt.Sprintf("%.2f", data.Swap),
 	}
 	if err := l.writeRow(l.RAMPath(), ramHeader, ramRow); err != nil {
 		return err
 	}
 
-	// 4. Log Disk
-	diskHeader := []string{"timestamp", "disk"}
-	diskRow := []string{
-		data.Timestamp.Format(time.RFC3339),
-		fmt.Sprintf("%.2f", data.Disk),
+	// 4. Log Disk (with multiple mounted partitions, or fallback to data.Disk)
+	var diskHeader []string
+	var diskRow []string
+	if len(data.Disks) == 0 {
+		diskHeader = []string{"timestamp", "disk"}
+		diskRow = []string{
+			data.Timestamp.Format(time.RFC3339),
+			fmt.Sprintf("%.2f", data.Disk),
+		}
+	} else {
+		diskHeader = make([]string, len(data.Disks)+1)
+		diskHeader[0] = "timestamp"
+		for i, d := range data.Disks {
+			diskHeader[i+1] = d.Mountpoint
+		}
+		diskRow = make([]string, len(data.Disks)+1)
+		diskRow[0] = data.Timestamp.Format(time.RFC3339)
+		for i, d := range data.Disks {
+			diskRow[i+1] = fmt.Sprintf("%.2f", d.UsedPercent)
+		}
 	}
 	if err := l.writeRow(l.DiskPath(), diskHeader, diskRow); err != nil {
 		return err
