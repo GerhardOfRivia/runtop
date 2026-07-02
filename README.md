@@ -14,6 +14,8 @@ curl -fsSL https://raw.githubusercontent.com/GerhardOfRivia/runtop/refs/heads/ma
 runtop "sleep 10"
 ```
 
+![demo](./demo.gif)
+
 Set RUNTOP_LOGPATH to log to a different directory.
 
 ```bash
