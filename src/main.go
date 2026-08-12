@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -43,22 +47,26 @@ func ParseArgs(args []string) (Config, error) {
 }
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	cfg, err := ParseArgs(os.Args)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		printUsage(Version)
-		os.Exit(1)
+		return 1
 	}
 
 	if cfg.Version {
 		fmt.Printf("runtop version: %s\n", Version)
-		return
+		return 0
 	}
 
 	if cfg.Command == "" {
 		fmt.Printf("Error: no command specified\n")
 		printUsage(Version)
-		os.Exit(1)
+		return 1
 	}
 
 	// Initialize the system telemetry collector.
@@ -66,7 +74,7 @@ func main() {
 
 	// Initialize logs.
 	var logger *MultiCSVLogger
-	var cmdWriter io.WriteCloser
+	var cmdWriter io.Writer
 
 	logPath := os.Getenv("RUNTOP_LOGPATH") // e.g. "./logs"
 	if logPath == "" {
@@ -76,31 +84,56 @@ func main() {
 	// Ensure the log directory exists
 	if err := os.MkdirAll(logPath, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: failed to create log directory: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	timestamp := time.Now().Format("20060102150405")
 	logger = NewMultiCSVLogger(logPath, timestamp)
+	defer func() {
+		if err := logger.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: failed to close telemetry logs: %v\n", err)
+		}
+	}()
 
 	cmdLog := filepath.Join(logPath, fmt.Sprintf("runtop-%s.log", timestamp))
 	f, err := os.OpenFile(cmdLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: failed to open command log file: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
-	cmdWriter = f
-	defer cmdWriter.Close()
+	bufferedCmdWriter := bufio.NewWriterSize(f, 64<<10)
+	cmdWriter = bufferedCmdWriter
+	defer func() {
+		if err := bufferedCmdWriter.Flush(); err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: failed to flush command log: %v\n", err)
+		}
+		if err := f.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: failed to close command log: %v\n", err)
+		}
+	}()
 
 	// Initialize the main TUI model.
 	model := NewModel(collector, logger, cmdWriter, cfg.Command)
 
 	// Run bubbletea program with the alternative screen buffer active to allow full window layouts.
-	program := tea.NewProgram(model, tea.WithAltScreen())
+	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithoutSignalHandler())
+	signals := make(chan os.Signal, 2)
+	programDone := make(chan struct{})
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	go func() {
+		select {
+		case <-signals:
+			program.Send(ShutdownRequestMsg{})
+		case <-programDone:
+		}
+	}()
 
 	m, err := program.Run()
+	close(programDone)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: runtop failed to run: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	finalModel := m.(*Model)
@@ -112,11 +145,23 @@ func main() {
 	}
 
 	if finalModel.exitErr != nil {
-		if exitError, ok := finalModel.exitErr.(*exec.ExitError); ok {
-			os.Exit(exitError.ExitCode())
-		}
-		os.Exit(1)
+		return processExitCode(finalModel.exitErr)
 	}
+	return 0
+}
+
+func processExitCode(err error) int {
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) {
+		return 1
+	}
+	if code := exitError.ExitCode(); code >= 0 {
+		return code
+	}
+	if status, ok := exitError.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		return 128 + int(status.Signal())
+	}
+	return 1
 }
 
 func writeMetaLog(filePath string, model *Model) error {
@@ -127,11 +172,7 @@ func writeMetaLog(filePath string, model *Model) error {
 
 	returnCode := 0
 	if model.exitErr != nil {
-		if exitError, ok := model.exitErr.(*exec.ExitError); ok {
-			returnCode = exitError.ExitCode()
-		} else {
-			returnCode = 1
-		}
+		returnCode = processExitCode(model.exitErr)
 	}
 
 	runtimeSec := float64(model.endTime.UnixNano()-model.startTime.UnixNano()) / 1e9
@@ -149,6 +190,7 @@ func writeMetaLog(filePath string, model *Model) error {
 
 func printUsage(version string) {
 	fmt.Printf("Usage: runtop (%s) [command]\n", version)
-	fmt.Println("  runtop [command]       # Execute a command")
-	fmt.Println("  runtop --version       # Show version")
+	fmt.Println("  runtop [command]                            # Execute a command")
+	fmt.Println("  runtop --version                            # Show version")
+	fmt.Println("  RUNTOP_LOGPATH=./my_logs/ runtop [command]  # Change log directory")
 }

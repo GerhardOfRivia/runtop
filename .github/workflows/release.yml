@@ -92,23 +92,6 @@ jobs:
 
           ls -lah release
 
-      - name: Create or Update latest Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Remove old latest release/tag if present
-          gh release delete latest --yes || true
-          git push origin :refs/tags/latest || true
-
-          # Recreate latest tag
-          git tag -f latest
-          git push origin latest -f
-
-          # Create latest release with all artifacts
-          gh release create latest release/* \
-            --title "Latest Build" \
-            --notes "Automated build from main (${GITHUB_SHA})"
-
       - name: Create or Update Versioned Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -122,6 +105,5 @@ jobs:
 
           # Create versioned release with all artifacts
           gh release create "${SEMVER}" release/* \
-            --title "runtop ${SEMVER}" \
+            --title "runtop ${SEMVER}" --latest \
             --notes "Automated release for version ${SEMVER}"
-

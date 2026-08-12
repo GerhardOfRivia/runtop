@@ -41,6 +41,19 @@ func TestSystemCollectorCollect(t *testing.T) {
 	}
 }
 
+func TestCollectProcessTelemetryIncludesRoot(t *testing.T) {
+	metrics, err := collectProcessTelemetry(int32(os.Getpid()))
+	if err != nil {
+		t.Fatalf("collect current process telemetry: %v", err)
+	}
+	if metrics.PID != int32(os.Getpid()) || metrics.Processes < 1 {
+		t.Fatalf("unexpected process telemetry: %+v", metrics)
+	}
+	if metrics.RSSBytes == 0 {
+		t.Fatal("expected non-zero RSS for current process")
+	}
+}
+
 func TestMultiCSVLogger(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "runtop-test")
 	if err != nil {
@@ -49,6 +62,7 @@ func TestMultiCSVLogger(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 
 	logger := NewMultiCSVLogger(tempDir, "20260701120000")
+	defer logger.Close()
 
 	data1 := TelemetryData{
 		Timestamp: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC),
@@ -56,6 +70,9 @@ func TestMultiCSVLogger(t *testing.T) {
 		RAM:       64.2,
 		GPUs:      []float64{30.1, 40.2},
 		Disk:      45.8,
+		Target: ProcessTelemetry{
+			PID: 123, Processes: 3, CPUPercent: 125.5, RSSBytes: 4096, ReadBytes: 1024, WriteBytes: 2048,
+		},
 	}
 
 	if err := logger.Log(data1); err != nil {
@@ -106,7 +123,7 @@ func TestMultiCSVLogger(t *testing.T) {
 	defer ramFile.Close()
 	ramReader := csv.NewReader(ramFile)
 	ramRecords, _ := ramReader.ReadAll()
-	if ramRecords[0][1] != "ram" || ramRecords[1][1] != "64.20" {
+	if ramRecords[0][1] != "ram_percent" || ramRecords[1][1] != "64.20" {
 		t.Errorf("Expected RAM values, got %v", ramRecords)
 	}
 
@@ -118,7 +135,39 @@ func TestMultiCSVLogger(t *testing.T) {
 	defer diskFile.Close()
 	diskReader := csv.NewReader(diskFile)
 	diskRecords, _ := diskReader.ReadAll()
-	if diskRecords[0][1] != "disk" || diskRecords[1][1] != "45.80" {
+	if diskRecords[0][3] != "used_percent" || diskRecords[1][3] != "45.80" {
 		t.Errorf("Expected Disk values, got %v", diskRecords)
+	}
+
+	processFile, err := os.Open(logger.ProcessPath())
+	if err != nil {
+		t.Fatalf("Failed to open process file: %v", err)
+	}
+	defer processFile.Close()
+	processRecords, err := csv.NewReader(processFile).ReadAll()
+	if err != nil {
+		t.Fatalf("Read process CSV: %v", err)
+	}
+	if processRecords[0][3] != "cpu_percent" || processRecords[1][3] != "125.50" {
+		t.Errorf("Expected process metrics, got %v", processRecords)
+	}
+}
+
+func TestMultiCSVLoggerRejectsSchemaChangesAndWritesAfterClose(t *testing.T) {
+	logger := NewMultiCSVLogger(t.TempDir(), "schema")
+	first := TelemetryData{Timestamp: time.Now(), CPUs: []float64{10}}
+	if err := logger.Log(first); err != nil {
+		t.Fatalf("first log: %v", err)
+	}
+	second := first
+	second.CPUs = []float64{10, 20}
+	if err := logger.Log(second); err == nil {
+		t.Fatal("expected CPU schema change to be rejected")
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatalf("close logger: %v", err)
+	}
+	if err := logger.Log(first); err == nil {
+		t.Fatal("expected logging after Close to fail")
 	}
 }

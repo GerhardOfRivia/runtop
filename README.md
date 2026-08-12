@@ -43,4 +43,28 @@ runtop "gpu-burn 30"
 RUNTOP_LOGPATH="/tmp/gpu_burn" runtop "gpu-burn 30"
 ```
 
-this will create a directory `/tmp/gpu_burn` with two files `runtop-YYYYMMDDHHMMSS.csv` and `runtop-YYYYMMDDHHMMSS.log`.
+This creates host CPU, GPU, RAM, and filesystem CSVs, plus a command-output log and summary file. While the target is running, `runtop-YYYYMMDDHHMMSS-process.csv` records aggregate process-tree CPU, RSS, read bytes, and write bytes.
+
+The dashboard remains open after the command finishes so its final output can be inspected. Press `q` to close it; quitting a running command terminates its process group before the terminal is restored.
+
+### developer guide
+
+test
+
+```bash
+make test
+```
+
+output:
+
+```txt
+...
+PASS
+ok      runtop/src      0.085s
+```
+
+build
+
+```bash
+make
+```
