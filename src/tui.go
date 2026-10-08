@@ -28,30 +28,33 @@ type TelemetryResultMsg struct {
 
 // Model represents the Bubbletea application state.
 type Model struct {
-	viewport         viewport.Model
-	treeViewport     viewport.Model
-	activeWindow     int // 0 = telemetry graphs (top), 1 = command output / process tree (bottom)
-	collector        TelemetryCollector
-	logger           *MultiCSVLogger
-	command          string
-	supervisor       *ProcessSupervisor
-	rootPID          int
-	telemetryData    TelemetryData
-	telemetryErr     error
-	sampling         bool
-	ready            bool
-	terminalWidth    int
-	terminalHeight   int
-	logLines         []string
-	exitErr          error
-	startTime        time.Time
-	endTime          time.Time
-	showProcessTree  bool
-	processTreeLines []string
-	confirmQuit      bool
-	quitting         bool
-	processRunning   bool
-	processComplete  bool
+	viewport          viewport.Model
+	treeViewport      viewport.Model
+	warningsViewport  viewport.Model
+	showWarnings      bool
+	activeWindow      int // 0 = telemetry graphs (top), 1 = command output / process tree (bottom)
+	collector         TelemetryCollector
+	logger            *MultiCSVLogger
+	command           string
+	supervisor        *ProcessSupervisor
+	rootPID           int
+	telemetryData     TelemetryData
+	telemetryErr      error
+	dismissedWarnings map[string]bool
+	sampling          bool
+	ready             bool
+	terminalWidth     int
+	terminalHeight    int
+	logLines          []string
+	exitErr           error
+	startTime         time.Time
+	endTime           time.Time
+	showProcessTree   bool
+	processTreeLines  []string
+	confirmQuit       bool
+	quitting          bool
+	processRunning    bool
+	processComplete   bool
 }
 
 // NewModel initializes the Bubbletea Model.
@@ -132,7 +135,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "ctrl+c":
 			return m.requestQuit()
+		case "d", "D":
+			m.dismissWarnings()
+			return m, nil
+		case "w", "W":
+			m.showWarnings = !m.showWarnings
+			return m, nil
 		case "m", "M":
+			m.showWarnings = false
 			m.showProcessTree = !m.showProcessTree
 			if m.showProcessTree && m.rootPID > 0 && m.processRunning {
 				cmds = append(cmds, collectProcessTree(m.rootPID))
@@ -215,7 +225,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.ready {
 		var vpCmd tea.Cmd
 		if m.activeWindow == 1 {
-			if m.showProcessTree {
+			if m.showWarnings {
+				m.warningsViewport, vpCmd = m.warningsViewport.Update(msg)
+			} else if m.showProcessTree {
 				m.treeViewport, vpCmd = m.treeViewport.Update(msg)
 			} else {
 				m.viewport, vpCmd = m.viewport.Update(msg)
@@ -225,6 +237,40 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+// warningMessages preserves context on wrapped errors while splitting joined warnings.
+func warningMessages(err error) []string {
+	if err == nil {
+		return nil
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var messages []string
+		for _, child := range joined.Unwrap() {
+			messages = append(messages, warningMessages(child)...)
+		}
+		return messages
+	}
+	return []string{err.Error()}
+}
+
+func (m *Model) visibleWarnings() []string {
+	var warnings []string
+	for _, message := range warningMessages(m.telemetryErr) {
+		if !m.dismissedWarnings[message] {
+			warnings = append(warnings, message)
+		}
+	}
+	return warnings
+}
+
+func (m *Model) dismissWarnings() {
+	if m.dismissedWarnings == nil {
+		m.dismissedWarnings = make(map[string]bool)
+	}
+	for _, message := range warningMessages(m.telemetryErr) {
+		m.dismissedWarnings[message] = true
+	}
 }
 
 func (m *Model) requestQuit() (tea.Model, tea.Cmd) {
@@ -246,6 +292,7 @@ func (m *Model) handleWindowSize(msg tea.WindowSizeMsg) {
 		m.viewport.SetContent(strings.Join(m.logLines, "\n"))
 		m.treeViewport = viewport.New(max(1, msg.Width-2), 10)
 		m.treeViewport.SetContent("")
+		m.warningsViewport = viewport.New(max(1, msg.Width-4), 10)
 		m.ready = true
 	}
 }
@@ -325,7 +372,9 @@ func (m *Model) View() string {
 		logStatus = fmt.Sprintf("logging: %s", m.logger.logDir)
 	}
 	modeName := "command output"
-	if m.showProcessTree {
+	if m.showWarnings {
+		modeName = "warnings"
+	} else if m.showProcessTree {
 		modeName = "process tree"
 	}
 	headerText := fmt.Sprintf("runtop: %s [%s] | mode: %s", m.command, logStatus, modeName)
@@ -376,7 +425,18 @@ func (m *Model) View() string {
 
 	var bottomBox string
 	headerStyle := lipgloss.NewStyle().Bold(true).Background(promptColor).Foreground(lipgloss.Color("#FFFFFF"))
-	if m.showProcessTree {
+	if m.showWarnings {
+		m.warningsViewport.Width = m.terminalWidth - 4
+		m.warningsViewport.Height = viewportHeight
+		messages := warningMessages(m.telemetryErr)
+		content := "No current telemetry warnings."
+		if len(messages) > 0 {
+			content = strings.Join(messages, "\n\n")
+		}
+		m.warningsViewport.SetContent(ansi.Hardwrap(content, m.warningsViewport.Width, false))
+		headerLine := headerStyle.Width(m.terminalWidth - 4).Render("warnings ([w] back)")
+		bottomBox = bottomBorderStyle.Width(m.terminalWidth - 2).Render(headerLine + "\n" + m.warningsViewport.View())
+	} else if m.showProcessTree {
 		headerText := fmt.Sprintf(" %5s %-8s %5s %5s %8s %s", "pid", "user", "cpu%", "mem%", "time", "command")
 		headerLine := headerStyle.Width(m.terminalWidth - 4).Render(headerText)
 
@@ -435,6 +495,21 @@ func (m *Model) View() string {
 		} else {
 			footer = combinedText
 		}
+	} else if warnings := m.visibleWarnings(); len(warnings) > 0 && !m.quitting && !m.processComplete && m.exitErr == nil {
+		helpText := "[w] view • [d] dismiss warnings"
+		footerWidth := m.terminalWidth - 2
+		if footerWidth < lipgloss.Width(helpText)+10 {
+			helpText = "[w] view [d] dismiss"
+		}
+		statusWidth := footerWidth - lipgloss.Width(helpText) - 1
+		status := fmt.Sprintf("telemetry warning: %s", strings.Join(strings.Fields(warnings[0]), " "))
+		if len(warnings) > 1 {
+			status = fmt.Sprintf("%d warnings: %s", len(warnings), strings.Join(strings.Fields(warnings[0]), " "))
+		}
+		status = ansi.Truncate(status, statusWidth, "...")
+		footer = lipgloss.NewStyle().Background(borderColor).Width(footerWidth).Render(
+			lipgloss.NewStyle().Foreground(warnColor).Width(statusWidth).Render(status) + " " +
+				lipgloss.NewStyle().Foreground(promptColor).Bold(true).Render(helpText))
 	} else {
 		var statusMsg string
 		if m.quitting && !m.processComplete {
@@ -443,23 +518,22 @@ func (m *Model) View() string {
 			statusMsg = fmt.Sprintf("exited with error: %v", m.exitErr)
 		} else if m.processComplete {
 			statusMsg = "finished successfully"
-		} else if m.telemetryErr != nil {
-			statusMsg = fmt.Sprintf("telemetry warning: %v", m.telemetryErr)
 		} else {
 			statusMsg = "running..."
 		}
 
 		statusText := fmt.Sprintf(" %s", statusMsg)
 
-		var helpText string
-		if m.terminalWidth-2 > len(statusText)+63 {
-			helpText = "[q/ctrl+c] quit • [m] toggle view • up/down or mouse to scroll"
-		} else if m.terminalWidth-2 > len(statusText)+39 {
-			helpText = "[q] quit • [m] toggle • up/down scroll"
-		} else if m.terminalWidth-2 > len(statusText)+22 {
-			helpText = "[q] quit • [m] toggle"
-		} else {
-			helpText = "[q] quit"
+		helpText := "[q] quit"
+		for _, candidate := range []string{
+			"[q] quit • [m] toggle • [w] warnings • up/down scroll",
+			"[q] quit • [m] toggle • [w] warnings",
+			"[q] quit • [w] warnings",
+		} {
+			if lipgloss.Width(statusText)+lipgloss.Width(candidate)+2 <= m.terminalWidth-2 {
+				helpText = candidate
+				break
+			}
 		}
 
 		statusStyle := lipgloss.NewStyle().Foreground(textColor).Bold(true)

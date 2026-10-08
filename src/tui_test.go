@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -511,4 +512,86 @@ func TestUniformGraphWidths(t *testing.T) {
 
 func graphCountOnLine(prefix string) int {
 	return strings.Count(prefix, "]")
+}
+
+func TestDismissTelemetryWarnings(t *testing.T) {
+	for _, input := range []string{"d", "D"} {
+		t.Run(input, func(t *testing.T) {
+			m := NewModel(&DummyCollector{}, nil, nil, "echo test")
+			m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+			warning := errors.New("collect disk usage for /private: permission denied")
+			m.Update(TelemetryResultMsg{Err: warning})
+			m.Update(StdoutLineMsg("keep command output"))
+			view := m.View()
+			if !strings.Contains(view, "[d] dismiss warnings") {
+				t.Fatal("missing dismiss control")
+			}
+			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(input)})
+			// Sampling repeats the same warning, including after a successful sample.
+			m.Update(TelemetryResultMsg{})
+			m.Update(TelemetryResultMsg{Err: errors.New(warning.Error())})
+			if strings.Contains(m.View(), "dismiss warnings") || len(m.visibleWarnings()) != 0 {
+				t.Fatal("dismissed warning reappeared")
+			}
+			if !strings.Contains(m.View(), "keep command output") {
+				t.Fatal("dismissal removed command output")
+			}
+			newWarning := errors.New("collect memory utilization: unavailable")
+			m.Update(TelemetryResultMsg{Err: errors.Join(warning, newWarning)})
+			if got := m.visibleWarnings(); len(got) != 1 || got[0] != newWarning.Error() {
+				t.Fatalf("expected only the new warning, got %v", got)
+			}
+		})
+	}
+}
+
+func TestWarningFooterFitsOneLine(t *testing.T) {
+	for _, width := range []int{30, 40, 80, 120} {
+		m := NewModel(&DummyCollector{}, nil, nil, "echo test")
+		m.Update(tea.WindowSizeMsg{Width: width, Height: 40})
+		baseline := strings.Count(m.View(), "\n")
+		m.Update(TelemetryResultMsg{Err: errors.Join(
+			errors.New("collect disk usage for /private: permission denied"),
+			errors.New("collect disk usage for /another/private/path: permission denied\nextra detail"),
+		)})
+		view := m.View()
+		if strings.Count(view, "\n") != baseline {
+			t.Fatalf("warnings added rows at width %d", width)
+		}
+		lines := strings.Split(view, "\n")
+		footer := lines[len(lines)-1]
+		if lipgloss.Width(footer) > width || !strings.Contains(footer, "[d] dismiss") || !strings.Contains(footer, "[w] view") {
+			t.Fatalf("invalid footer at width %d: %q", width, footer)
+		}
+	}
+}
+
+func TestWarningsViewer(t *testing.T) {
+	m := NewModel(&DummyCollector{}, nil, nil, "echo test")
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m.Update(StdoutLineMsg("command output retained"))
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("w")})
+	if !strings.Contains(m.View(), "No current telemetry warnings.") {
+		t.Fatal("missing empty warnings state")
+	}
+	warning := errors.New(strings.Repeat("permission denied for a long filesystem path ", 60))
+	m.Update(TelemetryResultMsg{Err: warning})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	if !strings.Contains(m.View(), "permission denied") {
+		t.Fatal("dismissed warnings must remain readable in the viewer")
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if m.warningsViewport.YOffset == 0 || m.viewport.YOffset != 0 {
+		t.Fatal("scrolling did not target the warnings viewer")
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("W")})
+	if m.showWarnings || !strings.Contains(m.View(), "command output retained") {
+		t.Fatal("did not restore command output")
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("m")})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("w")})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("w")})
+	if m.showWarnings || !m.showProcessTree {
+		t.Fatal("did not restore process tree")
+	}
 }

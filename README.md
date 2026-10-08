@@ -47,6 +47,8 @@ This creates host CPU, GPU, RAM, and filesystem CSVs, plus a command-output log 
 
 The dashboard remains open after the command finishes so its final output can be inspected. Press `q` to close it; quitting a running command terminates its process group before the terminal is restored.
 
+Telemetry warnings appear in a single line below the output viewer. Press `d` to hide the current warnings for the rest of the session. New warnings still appear. Press `w` to view all current warnings (including dismissed ones) in the main viewer, use up/down to scroll, and press `w` again to return to the previous view.
+
 ### developer guide
 
 test

@@ -1,5 +1,5 @@
 OUTPUT ?= runtop
-SEMVER ?= 1.1.1
+SEMVER ?= 1.1.2
 VERSION := $(SEMVER)-dev
 LDFLAGS = -ldflags "-X main.Version=$(VERSION)"
 
